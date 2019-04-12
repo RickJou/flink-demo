@@ -20,6 +20,7 @@ import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.AssignerWithPunctuatedWatermarks;
 import org.apache.flink.streaming.api.watermark.Watermark;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
@@ -108,7 +109,10 @@ public class KafkaJob {
                 public String getKey(T_tc_project_invest_order po) throws Exception {
                     return po.getUpdateDay() + po.getId();
                 }
-            }).window(TumblingProcessingTimeWindows.of(Time.seconds(10)))//滚动窗口
+            })
+                    //.window(TumblingProcessingTimeWindows.of(Time.seconds(10)))//翻滚窗口
+                    .window(TumblingEventTimeWindows.of(Time.seconds(10)))//时间时间翻滚窗口
+                    .allowedLateness(Time.seconds(5))//允许延时5秒
                     .reduce(new ReduceFunction<T_tc_project_invest_order>() {//去重(执行reduce取当天update_time最大的一条)
                         @Override
                         public T_tc_project_invest_order reduce(T_tc_project_invest_order t, T_tc_project_invest_order t1) throws Exception {
@@ -119,13 +123,15 @@ public class KafkaJob {
             StreamTableEnvironment tableEnv = TableEnvironment.getTableEnvironment(env);
 
             //注册表,且做业务查询
-            tableEnv.registerDataStream("t_tc_project_invest_order", finishStream, "status,create_time,amount,deadline,deadline_unit");
-            Table resultTable = tableEnv.sqlQuery("select create_time,sum(amount),deadline,deadline_unit from t_tc_project_invest_order where status='1' group by create_time,deadline,deadline_unit");
+            tableEnv.registerDataStream("t_tc_project_invest_order", finishStream, "status,create_day,amount,deadline,deadline_unit");
+            Table resultTable = tableEnv.sqlQuery("select create_day,sum(amount),deadline,deadline_unit from t_tc_project_invest_order where status='1' group by create_day,deadline,deadline_unit");
 
             //动态表转换为流,保存到hbase
             DataStream<Tuple2<Boolean, Row>> resultStream = tableEnv.toRetractStream(resultTable, Row.class);
-            resultStream.print();
-            //HBaseTableSink.emitDataStream(resultStream);
+            //DataStream<Row> resultStream = tableEnv.toAppendStream(resultTable, Row.class);
+            //resultStream.print();
+            HBaseTableSink.emitDataStream(resultStream);
+
 
             //查询优化
             //String explanation = tableEnv.explain(resultTable);

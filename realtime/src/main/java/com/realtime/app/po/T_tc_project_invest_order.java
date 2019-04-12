@@ -14,8 +14,6 @@ import java.math.BigDecimal;
 public class T_tc_project_invest_order extends BaseTablePo {
     private String id;
     private String status;
-    private String create_time;
-
     private BigDecimal amount;
     private String deadline;
     private String deadline_unit;

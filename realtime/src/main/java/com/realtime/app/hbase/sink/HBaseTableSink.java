@@ -18,7 +18,7 @@ public class HBaseTableSink {
         dataStream.map(new MapFunction<Tuple2<Boolean, Row>, Object>() {
             @Override
             public Object map(Tuple2<Boolean, Row> booleanRowTuple2) throws Exception {
-                //log.info(booleanRowTuple2.toString());
+                log.info(booleanRowTuple2.toString());
                 return null;
             }
         });

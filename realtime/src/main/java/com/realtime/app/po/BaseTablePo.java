@@ -20,8 +20,28 @@ import java.text.ParseException;
 public class BaseTablePo {
     private String update_time;
 
+    private String update_day;
+
+    private String create_time;
+
+    private String create_day;
+
     public String getUpdateDay() {//更新时间:天
         return update_time.substring(0, 10);
+    }
+
+    public void setUpdate_time(String update_time) {
+        this.update_time = update_time;
+        if(update_time!=null && update_time.length()>=10){
+            this.update_day = update_time.substring(0,10);
+        }
+    }
+
+    public void setCreate_time(String create_time) {
+        this.create_time = create_time;
+        if(create_time!=null && create_time.length()>=10){
+            this.create_day = create_time.substring(0,10);
+        }
     }
 
     /**
