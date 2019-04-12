@@ -1,4 +1,4 @@
-package com.realtime.app;
+package com.realtime.app.util;
 
 import java.text.DateFormat;
 import java.text.ParseException;

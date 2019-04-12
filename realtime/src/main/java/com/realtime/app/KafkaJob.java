@@ -1,9 +1,18 @@
 package com.realtime.app;
 
 import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSONObject;
 import com.realtime.app.deserializer.BinlogDeserializationSchema;
 import com.realtime.app.deserializer.BinlogDmlPo;
-import com.realtime.app.kafka.convert.BinlogConvert;
+import com.realtime.app.hbase.sink.HBaseTableSink;
+import com.realtime.app.po.BaseTablePo;
+import com.realtime.app.po.T_tc_project_invest_order;
+import com.realtime.app.util.BeanUtil;
+import com.realtime.app.util.DateUtil;
+import org.apache.flink.api.common.functions.FlatMapFunction;
+import org.apache.flink.api.common.functions.ReduceFunction;
+import org.apache.flink.api.java.functions.KeySelector;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.DataStream;
@@ -11,7 +20,14 @@ import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.AssignerWithPunctuatedWatermarks;
 import org.apache.flink.streaming.api.watermark.Watermark;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
+import org.apache.flink.table.api.Table;
+import org.apache.flink.table.api.TableEnvironment;
+import org.apache.flink.table.api.java.StreamTableEnvironment;
+import org.apache.flink.types.Row;
+import org.apache.flink.util.Collector;
 import org.apache.log4j.Logger;
 
 import java.text.ParseException;
@@ -26,7 +42,7 @@ public class KafkaJob {
             final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
             /*检查点相关,存储相关配置在flink.yml中进行了统一配置*/
-            env.enableCheckpointing(10*1000); // 10秒保存一次检查点
+            env.enableCheckpointing(10 * 1000); // 10秒保存一次检查点
             CheckpointConfig config = env.getCheckpointConfig();
             config.enableExternalizedCheckpoints(CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);//取消程序时保留检查点
             env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);//恰好一次语义
@@ -46,8 +62,8 @@ public class KafkaJob {
             properties.setProperty("heartbeat.interval.ms", "3000");
 
             FlinkKafkaConsumer<BinlogDmlPo> consumer = new FlinkKafkaConsumer<>(
-                    //java.util.regex.Pattern.compile("^(t_ac_*)|(t_tc_*)|(t_uc_*)"),//三个库中的表前缀匹配topic名称
-                    java.util.regex.Pattern.compile("(^t_ac_\\S*)|(^t_tc_\\S*)|(^t_uc_\\S*)"),
+                    //java.util.regex.Pattern.compile("(^t_ac_\\S*)|(^t_tc_\\S*)|(^t_uc_\\S*)"),//三个库中的表前缀匹配topic名称
+                    java.util.regex.Pattern.compile("t_tc_project_invest_order"),
                     new BinlogDeserializationSchema(),//自定义反序列化器
                     properties);
 
@@ -67,16 +83,58 @@ public class KafkaJob {
 
 
             /*增加时间和水位设置*/
-            consumer.assignTimestampsAndWatermarks(new KafkaJob().getBinlogAssignerWithPunctuatedWatermarks());
+            //consumer.assignTimestampsAndWatermarks(new KafkaJob().getBinlogAssignerWithPunctuatedWatermarks());
 
 
             DataStream<BinlogDmlPo> stream = env.addSource(consumer);
 
             //将源数据保存到hbase,将create_time和update_time索引数据保存到redis
 
+            //拆分一个record中包含多个sql
+            DataStream<T_tc_project_invest_order> RecordStream = stream.flatMap(new FlatMapFunction<BinlogDmlPo, T_tc_project_invest_order>() {
+                @Override
+                public void flatMap(BinlogDmlPo binlogDmlPo, Collector<T_tc_project_invest_order> collector) {
+                    for (int i = 0; i < binlogDmlPo.getRecords().size(); i++) {
+                        JSONObject rec = binlogDmlPo.getRecords().getJSONObject(i);
+                        T_tc_project_invest_order po = BeanUtil.map2Bean(rec.getInnerMap(), T_tc_project_invest_order.class);
+                        collector.collect(po);
+                    }
+                }
+            }).assignTimestampsAndWatermarks(new BaseTablePo().getCommonRecordAssignerWithPunctuatedWatermarks());//水位时间戳
+
+            //按同天的同一行记录进行分组
+            DataStream<T_tc_project_invest_order> finishStream = RecordStream.keyBy(new KeySelector<T_tc_project_invest_order, String>() {
+                @Override
+                public String getKey(T_tc_project_invest_order po) throws Exception {
+                    return po.getUpdateDay() + po.getId();
+                }
+            }).window(TumblingProcessingTimeWindows.of(Time.seconds(10)))//滚动窗口
+                    .reduce(new ReduceFunction<T_tc_project_invest_order>() {//去重(执行reduce取当天update_time最大的一条)
+                        @Override
+                        public T_tc_project_invest_order reduce(T_tc_project_invest_order t, T_tc_project_invest_order t1) throws Exception {
+                            return t1.getLong_update_time() > t.getLong_update_time() ? t1 : t;
+                        }
+                    });
+
+            StreamTableEnvironment tableEnv = TableEnvironment.getTableEnvironment(env);
+
+            //注册表,且做业务查询
+            tableEnv.registerDataStream("t_tc_project_invest_order", finishStream, "status,create_time,amount,deadline,deadline_unit");
+            Table resultTable = tableEnv.sqlQuery("select create_time,sum(amount),deadline,deadline_unit from t_tc_project_invest_order where status='1' group by create_time,deadline,deadline_unit");
+
+            //动态表转换为流,保存到hbase
+            DataStream<Tuple2<Boolean, Row>> resultStream = tableEnv.toRetractStream(resultTable, Row.class);
+            resultStream.print();
+            //HBaseTableSink.emitDataStream(resultStream);
+
+            //查询优化
+            //String explanation = tableEnv.explain(resultTable);
+            //log.info(explanation);
+            //finishStream.print();
 
 
-            stream.print();
+
+            //stream.print();
 
             env.execute("Flink Streaming Java API Skeleton");
         } catch (Exception ex) {
@@ -84,6 +142,12 @@ public class KafkaJob {
         }
     }
 
+
+    /**
+     * 获取压缩多条mdl语句的record时间戳和水位
+     *
+     * @return
+     */
     public AssignerWithPunctuatedWatermarks getBinlogAssignerWithPunctuatedWatermarks() {
         return new AssignerWithPunctuatedWatermarks<BinlogDmlPo>() {
             @Override
