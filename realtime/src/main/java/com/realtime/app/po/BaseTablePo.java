@@ -11,50 +11,54 @@ import org.apache.flink.streaming.api.watermark.Watermark;
 
 import javax.annotation.Nullable;
 import java.lang.reflect.InvocationTargetException;
+import java.sql.Timestamp;
 import java.text.ParseException;
+import java.util.Date;
 
 @Getter
 @Setter
 @NoArgsConstructor
 @ToString
 public class BaseTablePo {
-    private String update_time;
+    private Timestamp update_time;
 
-    private String update_day;
+    private String update_day;//更新时间:天
 
-    private String create_time;
+    private Timestamp create_time;
 
-    private String create_day;
+    private String create_day;//创建时间:天
 
-    public String getUpdateDay() {//更新时间:天
-        return update_time.substring(0, 10);
+    public String getUpdate_day() {
+        return getUpdateDay();
     }
 
-    public void setUpdate_time(String update_time) {
-        this.update_time = update_time;
-        if(update_time!=null && update_time.length()>=10){
-            this.update_day = update_time.substring(0,10);
-        }
+    public String getCreate_day() {
+        return getCreateDay();
     }
 
-    public void setCreate_time(String create_time) {
-        this.create_time = create_time;
-        if(create_time!=null && create_time.length()>=10){
-            this.create_day = create_time.substring(0,10);
+    private String getUpdateDay() {
+        if (update_day == null) {
+            Date date = new Date(this.update_time.getTime());
+            this.update_day = DateUtil.getDate(date);
         }
+        return update_day;
+    }
+
+    private String getCreateDay() {
+        if (create_day == null) {
+            Date date = new Date(this.create_time.getTime());
+            this.create_day = DateUtil.getDate(date);
+        }
+        return create_day;
     }
 
     /**
      * 修改时间:时间戳
+     *
      * @return
      */
-    public Long getLong_update_time(){
-        try {
-            return DateUtil.getTime(update_time);
-        } catch (ParseException e) {
-            e.printStackTrace();
-        }
-        return null;
+    public Long getLong_update_time() {
+        return update_time.getTime();
     }
 
 
@@ -62,13 +66,13 @@ public class BaseTablePo {
      * 获取通用表update作为时间戳和水位
      * @return
      */
-    public AssignerWithPunctuatedWatermarks getCommonRecordAssignerWithPunctuatedWatermarks() {
+    public AssignerWithPunctuatedWatermarks getCommonRecordAssignerWithPunctuatedWatermarks(String timeFieldName) {
         return new AssignerWithPunctuatedWatermarks<BaseTablePo>() {
             @Nullable
             @Override
             public Watermark checkAndGetNextWatermark(BaseTablePo po, long l) {
                 try {
-                    return new Watermark(DateUtil.getTime(BeanUtils.getProperty(po, "update_time")));
+                    return new Watermark(DateUtil.getUtcAdd8HourTime(BeanUtils.getProperty(po, timeFieldName)));
                 } catch (ParseException e) {
                     e.printStackTrace();
                 } catch (IllegalAccessException e) {
@@ -84,7 +88,7 @@ public class BaseTablePo {
             @Override
             public long extractTimestamp(BaseTablePo po, long l) {
                 try {
-                    return DateUtil.getTime(BeanUtils.getProperty(po, "update_time"));
+                    return DateUtil.getUtcAdd8HourTime(BeanUtils.getProperty(po, timeFieldName));
                 } catch (IllegalAccessException e) {
                     e.printStackTrace();
                 } catch (InvocationTargetException e) {

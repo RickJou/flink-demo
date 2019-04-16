@@ -4,7 +4,6 @@ import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 import com.realtime.app.deserializer.BinlogDeserializationSchema;
 import com.realtime.app.deserializer.BinlogDmlPo;
-import com.realtime.app.hbase.sink.HBaseTableSink;
 import com.realtime.app.po.BaseTablePo;
 import com.realtime.app.po.T_tc_project_invest_order;
 import com.realtime.app.util.BeanUtil;
@@ -16,13 +15,17 @@ import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+import org.apache.flink.streaming.api.datastream.WindowedStream;
 import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.AssignerWithPunctuatedWatermarks;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
-import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.api.windowing.triggers.ContinuousEventTimeTrigger;
+import org.apache.flink.streaming.api.windowing.triggers.CountTrigger;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
 import org.apache.flink.table.api.Table;
 import org.apache.flink.table.api.TableEnvironment;
@@ -50,7 +53,7 @@ public class KafkaJob {
 
 
             env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);// 使用事件时间
-
+            env.setParallelism(1);//并行度
 
             /*kafka属性*/
             Properties properties = new Properties();
@@ -98,39 +101,50 @@ public class KafkaJob {
                     for (int i = 0; i < binlogDmlPo.getRecords().size(); i++) {
                         JSONObject rec = binlogDmlPo.getRecords().getJSONObject(i);
                         T_tc_project_invest_order po = BeanUtil.map2Bean(rec.getInnerMap(), T_tc_project_invest_order.class);
+                        po.getUpdate_day();
+                        po.getCreate_day();
                         collector.collect(po);
                     }
                 }
-            }).assignTimestampsAndWatermarks(new BaseTablePo().getCommonRecordAssignerWithPunctuatedWatermarks());//水位时间戳
+            }).assignTimestampsAndWatermarks(new BaseTablePo().getCommonRecordAssignerWithPunctuatedWatermarks("create_time"));//水位时间戳
+
 
             //按同天的同一行记录进行分组
-            DataStream<T_tc_project_invest_order> finishStream = RecordStream.keyBy(new KeySelector<T_tc_project_invest_order, String>() {
-                @Override
-                public String getKey(T_tc_project_invest_order po) throws Exception {
-                    return po.getUpdateDay() + po.getId();
-                }
-            })
-                    //.window(TumblingProcessingTimeWindows.of(Time.seconds(10)))//翻滚窗口
-                    .window(TumblingEventTimeWindows.of(Time.seconds(10)))//时间时间翻滚窗口
-                    .allowedLateness(Time.seconds(5))//允许延时5秒
-                    .reduce(new ReduceFunction<T_tc_project_invest_order>() {//去重(执行reduce取当天update_time最大的一条)
-                        @Override
-                        public T_tc_project_invest_order reduce(T_tc_project_invest_order t, T_tc_project_invest_order t1) throws Exception {
-                            return t1.getLong_update_time() > t.getLong_update_time() ? t1 : t;
-                        }
+            WindowedStream<T_tc_project_invest_order, String, TimeWindow> window =
+                    RecordStream.keyBy((KeySelector<T_tc_project_invest_order, String>) po -> po.getId())
+                    .window(TumblingEventTimeWindows.of(Time.days(1), Time.hours(0)))//事件时间翻滚窗口一天一窗口
+                    //.trigger(ContinuousEventTimeTrigger.of(Time.seconds(15)))//5秒钟触发一次窗口计算
+                    .trigger(CountTrigger.of(1))
+                    .allowedLateness(Time.days(7));//允许延时7天
+
+            //微批数据去重(执行reduce取此批数据中,同id情况下update_time最大的一条)
+            DataStream<T_tc_project_invest_order> windowStream =
+                    window.reduce((ReduceFunction<T_tc_project_invest_order>) (t1, t2) -> {
+                        //log.info(t1.getLong_update_time());
+                        //log.info(t2.getLong_update_time());
+                        return t1.getLong_update_time() > t2.getLong_update_time() ? t1 : t2;
                     });
 
             StreamTableEnvironment tableEnv = TableEnvironment.getTableEnvironment(env);
 
-            //注册表,且做业务查询
-            tableEnv.registerDataStream("t_tc_project_invest_order", finishStream, "status,create_day,amount,deadline,deadline_unit");
-            Table resultTable = tableEnv.sqlQuery("select create_day,sum(amount),deadline,deadline_unit from t_tc_project_invest_order where status='1' group by create_day,deadline,deadline_unit");
+            Table dynamic_t_tc_project_invest_order = tableEnv.fromDataStream(windowStream, "id,update_time,status,create_day,amount,deadline,deadline_unit");
+            tableEnv.registerTable("dynamic_t_tc_project_invest_order", dynamic_t_tc_project_invest_order);
 
-            //动态表转换为流,保存到hbase
-            DataStream<Tuple2<Boolean, Row>> resultStream = tableEnv.toRetractStream(resultTable, Row.class);
-            //DataStream<Row> resultStream = tableEnv.toAppendStream(resultTable, Row.class);
-            //resultStream.print();
-            HBaseTableSink.emitDataStream(resultStream);
+
+            Table dynamictTable = tableEnv.sqlQuery(
+                    "select t1.create_day,sum(t1.amount) as amount,t1.deadline,t1.deadline_unit from dynamic_t_tc_project_invest_order t1\n" +
+                            "inner join \n" +
+                            "(\n" +
+                            "select id,max(update_time) as update_time from dynamic_t_tc_project_invest_order\n" +
+                            "group by id \n" +
+                            ") t2 on t1.id=t2.id and t1.update_time=t2.update_time\n" +
+                            "where t1.status='1'\n" +
+                            "group by t1.create_day,t1.amount,t1.deadline,t1.deadline_unit");
+
+
+            DataStream<Tuple2<Boolean, Row>> resultStream = tableEnv.toRetractStream(dynamictTable, Row.class);
+            resultStream.print();
+            //HBaseTableSink.emitDataStream(resultStream);
 
 
             //查询优化
@@ -138,9 +152,7 @@ public class KafkaJob {
             //log.info(explanation);
             //finishStream.print();
 
-
-
-            //stream.print();
+            //finishStream.print();
 
             env.execute("Flink Streaming Java API Skeleton");
         } catch (Exception ex) {
