@@ -1,10 +1,15 @@
 package com.realtime.app.hbase;
 
+import com.realtime.app.SyncKafkaRecordToHBase;
 import com.realtime.app.demo.User;
+import lombok.Getter;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hbase.*;
+import org.apache.hadoop.hbase.Cell;
+import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.client.*;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.log4j.Logger;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -14,59 +19,69 @@ import java.util.concurrent.Executors;
 
 public class HBaseUtil {
 
+    private static Logger log = Logger.getLogger(SyncKafkaRecordToHBase.class);
+
     private static Admin admin;
     // 创建一个定长线程池，可控制线程最大并发数，超出的线程会在队列中等待。
     private static ExecutorService executor = null;
     private static Connection connection = null;
 
+    public static Connection getConnection() {
+        return connection;
+    }
+
     //连接集群
     public static void init() throws IOException {
-        if(executor == null){
-            executor = Executors.newFixedThreadPool(2);
+        if (executor == null) {
+            executor = Executors.newFixedThreadPool(30);
         }
-        Configuration configuration = HBaseConfiguration.create();
-        configuration.set("hbase.zookeeper.property.clientPort", "2181");
-        configuration.set("hbase.zookeeper.quorum", "cdh1.com,cdh2.com,cdh3.com");
-        configuration.set("hbase.master", "cdh1.com:16000");
-        if(connection == null){
-            connection = ConnectionFactory.createConnection(configuration,executor);
+
+        if (connection == null) {
+            Configuration configuration = HBaseConfiguration.create();
+            configuration.set("hbase.zookeeper.property.clientPort", "2181");
+            configuration.set("hbase.zookeeper.quorum", "cdh1.com,cdh2.com,cdh3.com");
+            configuration.set("hbase.master", "cdh1.com:16000");
+            connection = ConnectionFactory.createConnection(configuration, executor);
         }
-        if(admin == null){
+        if (admin == null) {
             admin = connection.getAdmin();
         }
     }
 
-    public static void close()throws IOException{
-        if(admin == null){
+    public static void close() throws IOException {
+        if (admin == null) {
             admin.close();
         }
-        if(connection == null){
+        if (connection == null) {
             connection.close();
         }
-        if(executor!=null){
+        if (executor != null) {
             executor.shutdown();
         }
     }
 
     /**
      * 创建表
-     * @param tableName
-     * @param cols
+     *
+     * @param tableName 表名
+     * @param cfs       列簇
      * @throws IOException
      */
-    public static void createTable(String tableName, String[] cols) throws IOException {
+    public static void createTable(String tableName, String... cfs) throws IOException {
         TableName tname = TableName.valueOf(tableName);
         if (admin.tableExists(tname)) {
-            System.out.println("表已存在！");
+            log.info("表已存在:" + tname);
         } else {
-            HTableDescriptor hTableDescriptor = new HTableDescriptor(tname);
-            for (String col : cols) {
-                HColumnDescriptor hColumnDescriptor = new HColumnDescriptor(col);
-                hTableDescriptor.addFamily(hColumnDescriptor);
+            TableDescriptorBuilder tableBuilder = TableDescriptorBuilder.newBuilder(tname);//表名
+            for (String cf : cfs) {
+                tableBuilder.addColumnFamily(ColumnFamilyDescriptorBuilder.newBuilder(cf.getBytes()).build());
             }
-            admin.createTable(hTableDescriptor);
+            TableDescriptor tableDesc = tableBuilder.build();
+            admin.createTable(tableDesc, Bytes.toBytes("10000000"), Bytes.toBytes("100000000"), 20);
+            log.info("创建表:" + tname);
         }
     }
+
 
     //插入数据
     public static void insertData(String tableName, User user) throws IOException {

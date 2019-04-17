@@ -1,9 +1,9 @@
 package com.realtime.app.kafka.convert;
 
 import com.alibaba.fastjson.JSON;
-import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
-import com.realtime.app.deserializer.BinlogDmlPo;
+import com.realtime.app.binlog.BinlogDmlPo;
+import com.realtime.app.binlog.TableSchemaStore;
 
 import java.util.Arrays;
 
@@ -46,6 +46,7 @@ public class BinlogConvert {
             po.setRecords(recordJSObj.getJSONArray(DATA));
             po.setDatabaseName(recordJSObj.getString(DATABASE));
             po.setTableName(recordJSObj.getString(TABLE));
+            po.setPrimaryKeyName(TableSchemaStore.getTablePrimaryKeyName(recordJSObj.getString(TABLE)));
             return po;
         }
         return null;

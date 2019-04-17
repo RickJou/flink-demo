@@ -1,4 +1,4 @@
-package com.realtime.app.deserializer;
+package com.realtime.app.binlog;
 
 import com.realtime.app.kafka.convert.BinlogConvert;
 import org.apache.flink.annotation.PublicEvolving;

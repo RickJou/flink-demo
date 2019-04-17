@@ -1,13 +1,12 @@
 package com.realtime.app;
 
-import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
-import com.realtime.app.deserializer.BinlogDeserializationSchema;
-import com.realtime.app.deserializer.BinlogDmlPo;
+import com.realtime.app.binlog.BinlogCountTrigger;
+import com.realtime.app.binlog.BinlogDeserializationSchema;
+import com.realtime.app.binlog.BinlogDmlPo;
 import com.realtime.app.po.BaseTablePo;
 import com.realtime.app.po.T_tc_project_invest_order;
 import com.realtime.app.util.BeanUtil;
-import com.realtime.app.util.DateUtil;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.java.functions.KeySelector;
@@ -15,15 +14,11 @@ import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.DataStream;
-import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.datastream.WindowedStream;
 import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.AssignerWithPunctuatedWatermarks;
-import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
-import org.apache.flink.streaming.api.windowing.triggers.ContinuousEventTimeTrigger;
 import org.apache.flink.streaming.api.windowing.triggers.CountTrigger;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
@@ -34,7 +29,6 @@ import org.apache.flink.types.Row;
 import org.apache.flink.util.Collector;
 import org.apache.log4j.Logger;
 
-import java.text.ParseException;
 import java.util.Properties;
 
 public class KafkaJob {
@@ -112,47 +106,41 @@ public class KafkaJob {
             //按同天的同一行记录进行分组
             WindowedStream<T_tc_project_invest_order, String, TimeWindow> window =
                     RecordStream.keyBy((KeySelector<T_tc_project_invest_order, String>) po -> po.getId())
-                    .window(TumblingEventTimeWindows.of(Time.days(1), Time.hours(0)))//事件时间翻滚窗口一天一窗口
-                    //.trigger(ContinuousEventTimeTrigger.of(Time.seconds(15)))//5秒钟触发一次窗口计算
-                    .trigger(CountTrigger.of(1))
-                    .allowedLateness(Time.days(7));//允许延时7天
+                            .window(TumblingEventTimeWindows.of(Time.days(1), Time.hours(0)))//事件时间翻滚窗口一天一窗口
+                            //.trigger(ContinuousEventTimeTrigger.of(Time.seconds(15)))//5秒钟触发一次窗口计算
+                            //.trigger(CountTrigger.of(1))
+                            .trigger(BinlogCountTrigger.create(1))
+                            .allowedLateness(Time.days(1));//允许延时1天
 
             //微批数据去重(执行reduce取此批数据中,同id情况下update_time最大的一条)
             DataStream<T_tc_project_invest_order> windowStream =
                     window.reduce((ReduceFunction<T_tc_project_invest_order>) (t1, t2) -> {
-                        //log.info(t1.getLong_update_time());
-                        //log.info(t2.getLong_update_time());
                         return t1.getLong_update_time() > t2.getLong_update_time() ? t1 : t2;
                     });
 
             StreamTableEnvironment tableEnv = TableEnvironment.getTableEnvironment(env);
 
+            windowStream.print();
+
             Table dynamic_t_tc_project_invest_order = tableEnv.fromDataStream(windowStream, "id,update_time,status,create_day,amount,deadline,deadline_unit");
             tableEnv.registerTable("dynamic_t_tc_project_invest_order", dynamic_t_tc_project_invest_order);
 
 
-            Table dynamictTable = tableEnv.sqlQuery(
-                    "select t1.create_day,sum(t1.amount) as amount,t1.deadline,t1.deadline_unit from dynamic_t_tc_project_invest_order t1\n" +
-                            "inner join \n" +
-                            "(\n" +
-                            "select id,max(update_time) as update_time from dynamic_t_tc_project_invest_order\n" +
-                            "group by id \n" +
-                            ") t2 on t1.id=t2.id and t1.update_time=t2.update_time\n" +
-                            "where t1.status='1'\n" +
-                            "group by t1.create_day,t1.amount,t1.deadline,t1.deadline_unit");
+            //String sql = "select id,update_time,status,create_day,amount,deadline,deadline_unit from dynamic_t_tc_project_invest_order group by id,update_time,status,create_day,amount,deadline,deadline_unit";
+
+            String sql = "select create_day,sum(amount),deadline,deadline_unit from dynamic_t_tc_project_invest_order group by create_day,deadline,deadline_unit";
+
+
+            Table dynamictTable = tableEnv.sqlQuery(sql);
+
 
 
             DataStream<Tuple2<Boolean, Row>> resultStream = tableEnv.toRetractStream(dynamictTable, Row.class);
             resultStream.print();
+
+
             //HBaseTableSink.emitDataStream(resultStream);
 
-
-            //查询优化
-            //String explanation = tableEnv.explain(resultTable);
-            //log.info(explanation);
-            //finishStream.print();
-
-            //finishStream.print();
 
             env.execute("Flink Streaming Java API Skeleton");
         } catch (Exception ex) {
@@ -160,49 +148,4 @@ public class KafkaJob {
         }
     }
 
-
-    /**
-     * 获取压缩多条mdl语句的record时间戳和水位
-     *
-     * @return
-     */
-    public AssignerWithPunctuatedWatermarks getBinlogAssignerWithPunctuatedWatermarks() {
-        return new AssignerWithPunctuatedWatermarks<BinlogDmlPo>() {
-            @Override
-            public long extractTimestamp(BinlogDmlPo element, long previousElementTimestamp) {
-                return getUpdateTime(element);
-            }
-
-
-            @Override
-            public Watermark checkAndGetNextWatermark(BinlogDmlPo lastElement, long extractedTimestamp) {
-                if (lastElement != null) {
-                    return new Watermark(getUpdateTime(lastElement));
-                }
-                return null;
-            }
-
-            /**
-             * binlog to kafka 时,一个消息中存在多个dml sql,取其中最大的update作为时间戳和watermark
-             * @param po
-             * @return
-             */
-            private Long getUpdateTime(BinlogDmlPo po) {
-                JSONArray records = po.getRecords();
-                Long maxUpdateTime = 0L;
-                for (int i = 0; i < records.size(); i++) {
-                    String update_time = records.getJSONObject(i).getString("update_time");
-                    Long timestamp = 0L;
-                    try {
-                        timestamp = DateUtil.getTime(update_time);
-                    } catch (ParseException e) {
-                        log.error("无法转换解析后的update_time为long时间戳");
-                        e.printStackTrace();
-                    }
-                    maxUpdateTime = timestamp > maxUpdateTime ? timestamp : maxUpdateTime;
-                }
-                return maxUpdateTime == 0 ? null : maxUpdateTime;
-            }
-        };
-    }
 }
