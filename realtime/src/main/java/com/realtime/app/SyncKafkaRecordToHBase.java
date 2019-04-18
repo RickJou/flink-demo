@@ -1,12 +1,12 @@
 package com.realtime.app;
 
 import com.alibaba.fastjson.JSONObject;
-import com.google.common.collect.Lists;
 import com.realtime.app.binlog.*;
 import com.realtime.app.hbase.HBaseUtil;
 import com.realtime.app.hbase.sink.HBasePutBinlogRecordsSink;
 import com.realtime.app.util.DateUtil;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.java.functions.KeySelector;
@@ -17,7 +17,6 @@ import org.apache.flink.streaming.api.datastream.WindowedStream;
 import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.AssignerWithPunctuatedWatermarks;
-import org.apache.flink.streaming.api.functions.windowing.AllWindowFunction;
 import org.apache.flink.streaming.api.watermark.Watermark;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingProcessingTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
@@ -25,15 +24,17 @@ import org.apache.flink.streaming.api.windowing.triggers.CountTrigger;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
 import org.apache.flink.util.Collector;
-import org.apache.log4j.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.text.ParseException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
 
 public class SyncKafkaRecordToHBase {
 
-    private static Logger log = Logger.getLogger(SyncKafkaRecordToHBase.class);
+    private static Logger log = LoggerFactory.getLogger(SyncKafkaRecordToHBase.class);
 
     public static void main(String[] args) {
         try {
@@ -52,7 +53,7 @@ public class SyncKafkaRecordToHBase {
 
 
             //env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);// 使用事件时间
-            env.setStreamTimeCharacteristic(TimeCharacteristic.IngestionTime);// 使用提取时间,同步数据无需时间时间
+            env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime);// 使用处理时间,同步数据越快越好
             env.setParallelism(4);//并行度
 
             /*kafka属性*/
@@ -67,7 +68,8 @@ public class SyncKafkaRecordToHBase {
 
             FlinkKafkaConsumer<BinlogDmlPo> consumer = new FlinkKafkaConsumer<>(
                     //java.util.regex.Pattern.compile("(^t_ac_\\S*)|(^t_tc_\\S*)|(^t_uc_\\S*)"),//三个库中的表前缀匹配topic名称
-                    java.util.regex.Pattern.compile("(^t_tc_project_wait_publish)"),
+                    //java.util.regex.Pattern.compile("(^t_tc_project_wait_publish)"),
+                    java.util.regex.Pattern.compile("(^t_tc_project)"),
                     new BinlogDeserializationSchema(),//自定义反序列化器
                     properties);
 
@@ -97,10 +99,10 @@ public class SyncKafkaRecordToHBase {
 
             WindowedStream<BinlogRecord, String, TimeWindow> window =
                     //按同数据库,同表,同天,同一行记录进行分组
-                    RecordStream.keyBy((KeySelector<BinlogRecord, String>) po -> po.getDatabaseName()+po.getTableName()+po.getRecord().getString(po.getPrimaryKeyName()))
-                    .window(TumblingProcessingTimeWindows.of(Time.seconds(60), Time.hours(0)))//处理时间翻滚窗口
-                    .trigger(CountTrigger.of(1));
-                    //.allowedLateness(Time.hours(1));//允许延时
+                    RecordStream.keyBy((KeySelector<BinlogRecord, String>) po -> po.getDatabaseName() + po.getTableName() + po.getRecord().getString(po.getPrimaryKeyName()))
+                            .window(TumblingProcessingTimeWindows.of(Time.seconds(5), Time.hours(0)))//处理时间翻滚窗口
+                            .trigger(CountTrigger.of(1));
+            //.allowedLateness(Time.hours(1));//允许延时
 
 
             //微批数据去重(执行reduce取此批数据中,同id情况下update_time最大的一条)
@@ -109,20 +111,43 @@ public class SyncKafkaRecordToHBase {
                         String updateTimeKeyName = TableSchemaStore.getTableUpdateTimeKeyName(t1.getTableName());//可能是update_time;create_time
                         String t1UpdateTimeStr = t1.getRecord().getString(updateTimeKeyName);
                         String t2UpdateTimeStr = t2.getRecord().getString(updateTimeKeyName);
-                        if(StringUtils.isNotBlank(t1UpdateTimeStr)&&StringUtils.isNotBlank(t2UpdateTimeStr)){
-                            return  DateUtil.getTime(t1UpdateTimeStr)> DateUtil.getTime(t2UpdateTimeStr) ? t1 : t2;
+                        if (StringUtils.isNotBlank(t1UpdateTimeStr) && StringUtils.isNotBlank(t2UpdateTimeStr)) {
+                            return DateUtil.getTime(t1UpdateTimeStr) > DateUtil.getTime(t2UpdateTimeStr) ? t1 : t2;
                         }
                         return t2;
                     });
 
 
-            //hbase结果写入,以1秒一次时间窗口为一批,汇总为list对象(sink输出时没有批量操作,此处相当于使得一批为一个元素)
-            dataStream.timeWindowAll(Time.seconds(1)).apply(new AllWindowFunction<BinlogRecord, List<BinlogRecord>, TimeWindow>() {
-                @Override
-                public void apply(TimeWindow window, Iterable<BinlogRecord> values, Collector<List<BinlogRecord>> out) throws Exception {
-                    out.collect(Lists.newArrayList(values));
-                }
-            }).addSink(new HBasePutBinlogRecordsSink());
+            dataStream.keyBy((KeySelector<BinlogRecord, String>) value -> value.getDatabaseName() + value.getTableName())
+                    .timeWindow(Time.milliseconds(100))
+                    .aggregate(new AggregateFunction<BinlogRecord, List<BinlogRecord>, List<BinlogRecord>>() {
+                        @Override
+                        public List<BinlogRecord> createAccumulator() {
+                            //创建累加器
+                            return new ArrayList();
+                        }
+
+                        @Override
+                        public List<BinlogRecord> add(BinlogRecord value, List<BinlogRecord> accumulator) {
+                            //累加元素
+                            accumulator.add(value);
+                            return accumulator;
+                        }
+
+                        @Override
+                        public List<BinlogRecord> getResult(List<BinlogRecord> accumulator) {
+                            //此处累加器即结果
+                            return accumulator;
+                        }
+
+                        @Override
+                        public List<BinlogRecord> merge(List<BinlogRecord> a, List<BinlogRecord> b) {
+                            //合并多个累加器
+                            a.addAll(b);
+                            return a;
+                        }
+                    })
+                    .addSink(new HBasePutBinlogRecordsSink());//hbase批量结果写入
 
             env.execute("Flink Streaming Java API Skeleton");
         } catch (Exception ex) {
@@ -133,6 +158,7 @@ public class SyncKafkaRecordToHBase {
 
     /**
      * 以摄取时间作为水位时间
+     *
      * @return
      */
     public AssignerWithPunctuatedWatermarks getextractedTimestamp() {
@@ -141,6 +167,7 @@ public class SyncKafkaRecordToHBase {
             public long extractTimestamp(BinlogRecord element, long previousElementTimestamp) {
                 return previousElementTimestamp;
             }
+
             @Override
             public Watermark checkAndGetNextWatermark(BinlogRecord lastElement, long extractedTimestamp) {
                 return new Watermark(extractedTimestamp);

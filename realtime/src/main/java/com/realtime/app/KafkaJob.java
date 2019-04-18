@@ -17,9 +17,13 @@ import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.WindowedStream;
 import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.windowing.ProcessAllWindowFunction;
+import org.apache.flink.streaming.api.windowing.assigners.GlobalWindows;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.api.windowing.triggers.ContinuousEventTimeTrigger;
 import org.apache.flink.streaming.api.windowing.triggers.CountTrigger;
+import org.apache.flink.streaming.api.windowing.windows.GlobalWindow;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
 import org.apache.flink.table.api.Table;
@@ -107,7 +111,7 @@ public class KafkaJob {
             WindowedStream<T_tc_project_invest_order, String, TimeWindow> window =
                     RecordStream.keyBy((KeySelector<T_tc_project_invest_order, String>) po -> po.getId())
                             .window(TumblingEventTimeWindows.of(Time.days(1), Time.hours(0)))//事件时间翻滚窗口一天一窗口
-                            //.trigger(ContinuousEventTimeTrigger.of(Time.seconds(15)))//5秒钟触发一次窗口计算
+                            //.trigger(ContinuousEventTimeTrigger.of(Time.seconds(5)))//触发一次窗口计算
                             //.trigger(CountTrigger.of(1))
                             .trigger(BinlogCountTrigger.create(1))
                             .allowedLateness(Time.days(1));//允许延时1天
@@ -118,17 +122,19 @@ public class KafkaJob {
                         return t1.getLong_update_time() > t2.getLong_update_time() ? t1 : t2;
                     });
 
-            StreamTableEnvironment tableEnv = TableEnvironment.getTableEnvironment(env);
 
             windowStream.print();
 
+            /*
+
+            StreamTableEnvironment tableEnv = TableEnvironment.getTableEnvironment(env);
             Table dynamic_t_tc_project_invest_order = tableEnv.fromDataStream(windowStream, "id,update_time,status,create_day,amount,deadline,deadline_unit");
             tableEnv.registerTable("dynamic_t_tc_project_invest_order", dynamic_t_tc_project_invest_order);
 
 
-            //String sql = "select id,update_time,status,create_day,amount,deadline,deadline_unit from dynamic_t_tc_project_invest_order group by id,update_time,status,create_day,amount,deadline,deadline_unit";
+            String sql = "select id,update_time,status,create_day,amount,deadline,deadline_unit from dynamic_t_tc_project_invest_order";
 
-            String sql = "select create_day,sum(amount),deadline,deadline_unit from dynamic_t_tc_project_invest_order group by create_day,deadline,deadline_unit";
+            //String sql = "select create_day,sum(amount),deadline,deadline_unit from dynamic_t_tc_project_invest_order group by create_day,deadline,deadline_unit";
 
 
             Table dynamictTable = tableEnv.sqlQuery(sql);
@@ -136,7 +142,7 @@ public class KafkaJob {
 
 
             DataStream<Tuple2<Boolean, Row>> resultStream = tableEnv.toRetractStream(dynamictTable, Row.class);
-            resultStream.print();
+            resultStream.print();*/
 
 
             //HBaseTableSink.emitDataStream(resultStream);
