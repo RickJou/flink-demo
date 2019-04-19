@@ -33,7 +33,7 @@ public class HBaseUtil {
     //连接集群
     public static void init() throws IOException {
         if (executor == null) {
-            executor = Executors.newFixedThreadPool(30);
+            executor = Executors.newFixedThreadPool(100);
         }
 
         if (connection == null) {

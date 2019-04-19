@@ -47,10 +47,11 @@ public class SyncKafkaRecordToHBase {
 
             /*检查点相关,存储相关配置在flink.yml中进行了统一配置*/
             env.enableCheckpointing(10 * 1000); // 10秒保存一次检查点
-            CheckpointConfig config = env.getCheckpointConfig();
-            config.enableExternalizedCheckpoints(CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);//取消程序时保留检查点
             env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);//恰好一次语义
-
+            env.getCheckpointConfig().setMinPauseBetweenCheckpoints(5000);//相邻的检查点之间,最少间隔5秒钟
+            env.getCheckpointConfig().setCheckpointTimeout(60000);//检查点执行时,如果存储数据超过一分钟,则终止
+            env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);//检查点并行数
+            env.getCheckpointConfig().enableExternalizedCheckpoints(CheckpointConfig.ExternalizedCheckpointCleanup.DELETE_ON_CANCELLATION);//取消程序时删除检查点
 
             //env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);// 使用事件时间
             env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime);// 使用处理时间,同步数据越快越好
@@ -67,9 +68,9 @@ public class SyncKafkaRecordToHBase {
             properties.setProperty("heartbeat.interval.ms", "3000");
 
             FlinkKafkaConsumer<BinlogDmlPo> consumer = new FlinkKafkaConsumer<>(
-                    //java.util.regex.Pattern.compile("(^t_ac_\\S*)|(^t_tc_\\S*)|(^t_uc_\\S*)"),//三个库中的表前缀匹配topic名称
+                    java.util.regex.Pattern.compile("(^t_ac_\\S*)|(^t_tc_\\S*)|(^t_uc_\\S*)"),//三个库中的表前缀匹配topic名称
                     //java.util.regex.Pattern.compile("(^t_tc_project_wait_publish)"),
-                    java.util.regex.Pattern.compile("(^t_tc_project)"),
+                    //java.util.regex.Pattern.compile("(^t_tc_project)"),
                     new BinlogDeserializationSchema(),//自定义反序列化器
                     properties);
 
@@ -100,7 +101,7 @@ public class SyncKafkaRecordToHBase {
             WindowedStream<BinlogRecord, String, TimeWindow> window =
                     //按同数据库,同表,同天,同一行记录进行分组
                     RecordStream.keyBy((KeySelector<BinlogRecord, String>) po -> po.getDatabaseName() + po.getTableName() + po.getRecord().getString(po.getPrimaryKeyName()))
-                            .window(TumblingProcessingTimeWindows.of(Time.seconds(5), Time.hours(0)))//处理时间翻滚窗口
+                            .window(TumblingProcessingTimeWindows.of(Time.seconds(3), Time.hours(0)))//处理时间翻滚窗口
                             .trigger(CountTrigger.of(1));
             //.allowedLateness(Time.hours(1));//允许延时
 
@@ -119,40 +120,48 @@ public class SyncKafkaRecordToHBase {
 
 
             dataStream.keyBy((KeySelector<BinlogRecord, String>) value -> value.getDatabaseName() + value.getTableName())
-                    .timeWindow(Time.milliseconds(100))
-                    .aggregate(new AggregateFunction<BinlogRecord, List<BinlogRecord>, List<BinlogRecord>>() {
-                        @Override
-                        public List<BinlogRecord> createAccumulator() {
-                            //创建累加器
-                            return new ArrayList();
-                        }
-
-                        @Override
-                        public List<BinlogRecord> add(BinlogRecord value, List<BinlogRecord> accumulator) {
-                            //累加元素
-                            accumulator.add(value);
-                            return accumulator;
-                        }
-
-                        @Override
-                        public List<BinlogRecord> getResult(List<BinlogRecord> accumulator) {
-                            //此处累加器即结果
-                            return accumulator;
-                        }
-
-                        @Override
-                        public List<BinlogRecord> merge(List<BinlogRecord> a, List<BinlogRecord> b) {
-                            //合并多个累加器
-                            a.addAll(b);
-                            return a;
-                        }
-                    })
+                    .timeWindow(Time.milliseconds(300))
+                    .aggregate(binlogRecordFoldAggregateFunction())
                     .addSink(new HBasePutBinlogRecordsSink());//hbase批量结果写入
 
             env.execute("Flink Streaming Java API Skeleton");
         } catch (Exception ex) {
             ex.printStackTrace();
         }
+    }
+
+    /**
+     * 将多条binlogRecord累加折叠到list<binlogRecord>中
+     * @return
+     */
+    public static AggregateFunction binlogRecordFoldAggregateFunction(){
+        return new AggregateFunction<BinlogRecord, List<BinlogRecord>, List<BinlogRecord>>() {
+            @Override
+            public List<BinlogRecord> createAccumulator() {
+                //创建累加器
+                return new ArrayList();
+            }
+
+            @Override
+            public List<BinlogRecord> add(BinlogRecord value, List<BinlogRecord> accumulator) {
+                //累加元素
+                accumulator.add(value);
+                return accumulator;
+            }
+
+            @Override
+            public List<BinlogRecord> getResult(List<BinlogRecord> accumulator) {
+                //此处累加器即结果
+                return accumulator;
+            }
+
+            @Override
+            public List<BinlogRecord> merge(List<BinlogRecord> a, List<BinlogRecord> b) {
+                //合并多个累加器
+                a.addAll(b);
+                return a;
+            }
+        };
     }
 
 

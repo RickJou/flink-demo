@@ -10,26 +10,17 @@ import com.realtime.app.util.BeanUtil;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.java.functions.KeySelector;
-import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.runtime.state.memory.MemoryStateBackend;
 import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.WindowedStream;
 import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.api.functions.windowing.ProcessAllWindowFunction;
-import org.apache.flink.streaming.api.windowing.assigners.GlobalWindows;
 import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
 import org.apache.flink.streaming.api.windowing.time.Time;
-import org.apache.flink.streaming.api.windowing.triggers.ContinuousEventTimeTrigger;
-import org.apache.flink.streaming.api.windowing.triggers.CountTrigger;
-import org.apache.flink.streaming.api.windowing.windows.GlobalWindow;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
-import org.apache.flink.table.api.Table;
-import org.apache.flink.table.api.TableEnvironment;
-import org.apache.flink.table.api.java.StreamTableEnvironment;
-import org.apache.flink.types.Row;
 import org.apache.flink.util.Collector;
 import org.apache.log4j.Logger;
 
@@ -43,15 +34,22 @@ public class KafkaJob {
         try {
             final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
+            /*state相关*/
+            env.setStateBackend(new MemoryStateBackend(5 * 1024 * 1024,false));
+            //env.setStateBackend(new FsStateBackend("hdfs:///flink/checkpoints"));
+
+
             /*检查点相关,存储相关配置在flink.yml中进行了统一配置*/
             env.enableCheckpointing(10 * 1000); // 10秒保存一次检查点
-            CheckpointConfig config = env.getCheckpointConfig();
-            config.enableExternalizedCheckpoints(CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);//取消程序时保留检查点
             env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);//恰好一次语义
+            env.getCheckpointConfig().setMinPauseBetweenCheckpoints(5000);//相邻的检查点之间,最少间隔5秒钟
+            env.getCheckpointConfig().setCheckpointTimeout(60000);//检查点执行时,如果存储数据超过一分钟,则终止
+            env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);//检查点并行数
+            env.getCheckpointConfig().enableExternalizedCheckpoints(CheckpointConfig.ExternalizedCheckpointCleanup.DELETE_ON_CANCELLATION);//取消程序时删除检查点
 
 
-            env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);// 使用事件时间
             env.setParallelism(1);//并行度
+            env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);// 使用事件时间
 
             /*kafka属性*/
             Properties properties = new Properties();
@@ -82,7 +80,6 @@ public class KafkaJob {
             specificStartOffsets.put(new KafkaTopicPartition("myTopic", 2), 20L);
             consumer.setStartFromSpecificOffsets(specificStartOffsets);//从消费组指定offset位置开始读取record ,the default behaviour
             */
-
 
             /*增加时间和水位设置*/
             //consumer.assignTimestampsAndWatermarks(new KafkaJob().getBinlogAssignerWithPunctuatedWatermarks());
