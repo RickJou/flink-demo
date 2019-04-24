@@ -51,11 +51,11 @@ public class SyncKafkaRecordToHBase {
             env.getCheckpointConfig().setMinPauseBetweenCheckpoints(5000);//相邻的检查点之间,最少间隔5秒钟
             env.getCheckpointConfig().setCheckpointTimeout(60000);//检查点执行时,如果存储数据超过一分钟,则终止
             env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);//检查点并行数
-            env.getCheckpointConfig().enableExternalizedCheckpoints(CheckpointConfig.ExternalizedCheckpointCleanup.DELETE_ON_CANCELLATION);//取消程序时删除检查点
+            env.getCheckpointConfig().enableExternalizedCheckpoints(CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);//取消程序时保留检查点
 
             //env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);// 使用事件时间
             env.setStreamTimeCharacteristic(TimeCharacteristic.ProcessingTime);// 使用处理时间,同步数据越快越好
-            env.setParallelism(4);//并行度
+            env.setParallelism(2);//并行度
 
             /*kafka属性*/
             Properties properties = new Properties();
@@ -78,7 +78,7 @@ public class SyncKafkaRecordToHBase {
             consumer.setStartFromEarliest();     // 从最早记录开始读取
 
             /*增加时间和水位设置*/
-            //consumer.assignTimestampsAndWatermarks(new KafkaJob().getBinlogAssignerWithPunctuatedWatermarks());
+            //consumer.assignTimestampsAndWatermarks(new SyncKafkaRecordToHBase().getExtractedTimestamp());
 
             DataStream<BinlogDmlPo> stream = env.addSource(consumer);
             //拆分一个record中包含多个sql
@@ -95,8 +95,9 @@ public class SyncKafkaRecordToHBase {
                         out.collect(br);
                     }
                 }
-            });
-            //.assignTimestampsAndWatermarks(new SyncKafkaRecordToHBase().getextractedTimestamp());//水位时间戳
+            }).setParallelism(4)
+            .assignTimestampsAndWatermarks(new SyncKafkaRecordToHBase().getExtractedTimestamp()).setParallelism(4);//水位时间戳
+
 
             WindowedStream<BinlogRecord, String, TimeWindow> window =
                     //按同数据库,同表,同天,同一行记录进行分组
@@ -116,15 +117,16 @@ public class SyncKafkaRecordToHBase {
                             return DateUtil.getTime(t1UpdateTimeStr) > DateUtil.getTime(t2UpdateTimeStr) ? t1 : t2;
                         }
                         return t2;
-                    });
+                    }).setParallelism(2);
 
 
             dataStream.keyBy((KeySelector<BinlogRecord, String>) value -> value.getDatabaseName() + value.getTableName())
                     .timeWindow(Time.milliseconds(300))
                     .aggregate(binlogRecordFoldAggregateFunction())
+                    .setParallelism(2)
                     .addSink(new HBasePutBinlogRecordsSink());//hbase批量结果写入
 
-            env.execute("Flink Streaming Java API Skeleton");
+            env.execute("SyncKafkaRecordToHBase");
         } catch (Exception ex) {
             ex.printStackTrace();
         }
@@ -170,7 +172,7 @@ public class SyncKafkaRecordToHBase {
      *
      * @return
      */
-    public AssignerWithPunctuatedWatermarks getextractedTimestamp() {
+    public AssignerWithPunctuatedWatermarks getExtractedTimestamp() {
         return new AssignerWithPunctuatedWatermarks<BinlogRecord>() {
             @Override
             public long extractTimestamp(BinlogRecord element, long previousElementTimestamp) {

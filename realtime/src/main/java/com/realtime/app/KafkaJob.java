@@ -10,6 +10,7 @@ import com.realtime.app.util.BeanUtil;
 import org.apache.flink.api.common.functions.FlatMapFunction;
 import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.java.functions.KeySelector;
+import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.runtime.state.memory.MemoryStateBackend;
 import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.TimeCharacteristic;
@@ -21,6 +22,10 @@ import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindo
 import org.apache.flink.streaming.api.windowing.time.Time;
 import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
+import org.apache.flink.table.api.Table;
+import org.apache.flink.table.api.TableEnvironment;
+import org.apache.flink.table.api.java.StreamTableEnvironment;
+import org.apache.flink.types.Row;
 import org.apache.flink.util.Collector;
 import org.apache.log4j.Logger;
 
@@ -84,10 +89,9 @@ public class KafkaJob {
             /*增加时间和水位设置*/
             //consumer.assignTimestampsAndWatermarks(new KafkaJob().getBinlogAssignerWithPunctuatedWatermarks());
 
-
+            //将kafka作为source抽取数据
             DataStream<BinlogDmlPo> stream = env.addSource(consumer);
 
-            //将源数据保存到hbase,将create_time和update_time索引数据保存到redis
 
             //拆分一个record中包含多个sql
             DataStream<T_tc_project_invest_order> RecordStream = stream.flatMap(new FlatMapFunction<BinlogDmlPo, T_tc_project_invest_order>() {
@@ -101,7 +105,9 @@ public class KafkaJob {
                         collector.collect(po);
                     }
                 }
-            }).assignTimestampsAndWatermarks(new BaseTablePo().getCommonRecordAssignerWithPunctuatedWatermarks("create_time"));//水位时间戳
+            })
+            .assignTimestampsAndWatermarks(new BaseTablePo().getCommonRecordAssignerWithPunctuatedWatermarks("create_time"));//以create_time作为水位时间戳
+
 
 
             //按同天的同一行记录进行分组
@@ -114,15 +120,14 @@ public class KafkaJob {
                             .allowedLateness(Time.days(1));//允许延时1天
 
             //微批数据去重(执行reduce取此批数据中,同id情况下update_time最大的一条)
-            DataStream<T_tc_project_invest_order> windowStream =
-                    window.reduce((ReduceFunction<T_tc_project_invest_order>) (t1, t2) -> {
+            DataStream<T_tc_project_invest_order> windowStream = window.reduce((ReduceFunction<T_tc_project_invest_order>) (t1, t2) -> {
                         return t1.getLong_update_time() > t2.getLong_update_time() ? t1 : t2;
                     });
 
 
             windowStream.print();
 
-            /*
+
 
             StreamTableEnvironment tableEnv = TableEnvironment.getTableEnvironment(env);
             Table dynamic_t_tc_project_invest_order = tableEnv.fromDataStream(windowStream, "id,update_time,status,create_day,amount,deadline,deadline_unit");
@@ -139,7 +144,7 @@ public class KafkaJob {
 
 
             DataStream<Tuple2<Boolean, Row>> resultStream = tableEnv.toRetractStream(dynamictTable, Row.class);
-            resultStream.print();*/
+            resultStream.print();
 
 
             //HBaseTableSink.emitDataStream(resultStream);
